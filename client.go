@@ -17,6 +17,11 @@ import (
 	"github.com/lucas-clemente/quic-go/qerr"
 )
 
+var (
+	clientMultiplexer     *multiplexer
+	clientMultiplexerOnce sync.Once
+)
+
 type client struct {
 	mutex sync.Mutex
 
@@ -44,6 +49,8 @@ type client struct {
 	logger utils.Logger
 }
 
+var _ packetHandler = &client{}
+
 var (
 	// make it possible to mock connection ID generation in the tests
 	generateConnectionID         = protocol.GenerateConnectionID
@@ -61,7 +68,15 @@ func DialAddr(addr string, tlsConf *tls.Config, config *Config) (Session, error)
 	if err != nil {
 		return nil, err
 	}
-	return Dial(udpConn, udpAddr, addr, tlsConf, config)
+	c, err := createClient(udpConn, udpAddr, config, tlsConf, addr)
+	if err != nil {
+		return nil, err
+	}
+	go c.listen()
+	if err := c.dial(); err != nil {
+		return nil, err
+	}
+	return c.session, nil
 }
 
 // Dial establishes a new QUIC connection to a server using a net.PacketConn.
@@ -73,6 +88,22 @@ func Dial(
 	tlsConf *tls.Config,
 	config *Config,
 ) (Session, error) {
+	clientMultiplexerOnce.Do(func() {
+		clientMultiplexer = newClientMultiplexer(utils.DefaultLogger)
+	})
+
+	c, err := createClient(pconn, remoteAddr, config, tlsConf, host)
+	if err != nil {
+		return nil, err
+	}
+	clientMultiplexer.Add(pconn, c)
+	if err := c.dial(); err != nil {
+		return nil, err
+	}
+	return c.session, nil
+}
+
+func createClient(pconn net.PacketConn, remoteAddr net.Addr, config *Config, tlsConf *tls.Config, host string) (*client, error) {
 	clientConfig := populateClientConfig(config)
 	version := clientConfig.Versions[0]
 	srcConnID, err := generateConnectionID()
@@ -106,7 +137,7 @@ func Dial(
 			}
 		}
 	}
-	c := &client{
+	return &client{
 		conn:          &conn{pconn: pconn, currentAddr: remoteAddr},
 		srcConnID:     srcConnID,
 		destConnID:    destConnID,
@@ -116,14 +147,7 @@ func Dial(
 		version:       version,
 		handshakeChan: make(chan struct{}),
 		logger:        utils.DefaultLogger.WithPrefix("client"),
-	}
-
-	c.logger.Infof("Starting new connection to %s (%s -> %s), source connection ID %s, destination connection ID %s, version %s", hostname, c.conn.LocalAddr(), c.conn.RemoteAddr(), c.srcConnID, c.destConnID, c.version)
-
-	if err := c.dial(); err != nil {
-		return nil, err
-	}
-	return c.session, nil
+	}, nil
 }
 
 // populateClientConfig populates fields in the quic.Config with their default values, if none are set
@@ -181,6 +205,8 @@ func populateClientConfig(config *Config) *Config {
 }
 
 func (c *client) dial() error {
+	c.logger.Infof("Starting new connection to %s (%s -> %s), source connection ID %s, destination connection ID %s, version %s", c.hostname, c.conn.LocalAddr(), c.conn.RemoteAddr(), c.srcConnID, c.destConnID, c.version)
+
 	var err error
 	if c.version.UsesTLS() {
 		err = c.dialTLS()
@@ -197,7 +223,6 @@ func (c *client) dialGQUIC() error {
 	if err := c.createNewGQUICSession(); err != nil {
 		return err
 	}
-	go c.listen()
 	return c.establishSecureConnection()
 }
 
@@ -223,7 +248,6 @@ func (c *client) dialTLS() error {
 	if err := c.createNewTLSSession(extHandler.GetPeerParams(), c.version); err != nil {
 		return err
 	}
-	go c.listen()
 	if err := c.establishSecureConnection(); err != nil {
 		if err != handshake.ErrCloseSessionForRetry {
 			return err
@@ -485,4 +509,13 @@ func (c *client) createNewTLSSession(
 		c.logger,
 	)
 	return err
+}
+
+func (c *client) Close(err error) error {
+	c.mutex.Lock()
+	defer c.mutex.Unlock()
+	if c.session == nil {
+		return nil
+	}
+	return c.session.Close(err)
 }
